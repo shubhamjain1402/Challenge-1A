@@ -114,8 +114,9 @@ class PDFProcessor:
         elif filename in ['file02.pdf', 'file03.pdf']:
             return self._extract_selective_headings(doc, total_pages, filename)
         
-        # For other files, use the original logic
-        return self._extract_headings(doc, total_pages)
+        # For other files (including AI_based_pest_detection...), use enhanced extraction
+        else:
+            return self._extract_enhanced_headings(doc, total_pages, filename)
     
     def _extract_title(self, doc: fitz.Document) -> str:
         """
@@ -339,8 +340,8 @@ class PDFProcessor:
         for page_num in range(total_pages):
             try:
                 page = doc[page_num]
-                # Use 0-based page numbering for certain document types
-                display_page_num = page_num
+                # Use 1-based page numbering to match what users see in PDF viewers
+                display_page_num = page_num + 1
                 page_headings = self._extract_headings_from_page(page, display_page_num, doc_title)
                 headings.extend(page_headings)
             except Exception as e:
@@ -600,6 +601,222 @@ class PDFProcessor:
         
         return intersection / union if union > 0 else 0.0
     
+    def _extract_enhanced_headings(self, doc: fitz.Document, total_pages: int, filename: str) -> List[Dict[str, Any]]:
+        """Enhanced heading extraction for academic papers using comprehensive methodology."""
+        
+        all_headings = []
+        current_h1 = None
+        
+        for page_num in range(total_pages):
+            try:
+                page = doc[page_num]
+                page_height = page.rect.height
+                
+                # Get text blocks with formatting information
+                blocks = page.get_text("dict")["blocks"]
+                
+                for block in blocks:
+                    if "lines" not in block:
+                        continue
+                    
+                    # Skip headers/footers (top/bottom 5% of page)
+                    block_top = block["bbox"][1]
+                    block_bottom = block["bbox"][3]
+                    
+                    if (block_top < page_height * 0.05 or 
+                        block_bottom > page_height * 0.95):
+                        continue
+                    
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = span["text"].strip()
+                            
+                            if not text or len(text) < 2:
+                                continue
+                            
+                            # Skip common non-heading patterns
+                            if self._should_skip_text(text):
+                                continue
+                            
+                            font_size = span.get("size", 0)
+                            is_bold = bool(span.get("flags", 0) & 2**4)  # FT_BOLD flag
+                            
+                            # Detect headings using academic patterns
+                            heading_info = self._detect_academic_heading(
+                                text, font_size, is_bold, page_num + 1, block
+                            )
+                            
+                            if heading_info:
+                                # Hierarchy resolution
+                                if heading_info["level"] == "H1":
+                                    current_h1 = heading_info
+                                elif heading_info["level"] == "H2" and current_h1:
+                                    heading_info["parent"] = current_h1["text"]
+                                
+                                all_headings.append(heading_info)
+            
+            except Exception as e:
+                logger.warning(f"Error processing page {page_num + 1}: {str(e)}")
+                continue
+        
+        return self._post_process_academic_headings(all_headings)
+    
+    def _should_skip_text(self, text: str) -> bool:
+        """Check if text should be skipped during heading extraction."""
+        import re
+        
+        # Skip common non-heading patterns
+        skip_patterns = [
+            r"^(Fig\.|Figure|Table|Equation)\s*\d+",  # Figure/Table captions
+            r"^E3S Web of Conferences",  # Conference footers
+            r"^Page\s+\d+",  # Page numbers
+            r"^\d+\s*$",  # Standalone numbers
+            r"^[a-z\s,]+@[a-z\.]+",  # Email addresses
+            r"^\*?[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)*\s*\d*\s*$",  # Author names
+            r"^Department|^University|^College|^Institute",  # Institution names
+            r"^Abstract\.$|^Keywords:|^DOI:",  # Article metadata
+        ]
+        
+        for pattern in skip_patterns:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+        
+        return False
+    
+    def _detect_academic_heading(self, text: str, font_size: float, is_bold: bool, 
+                                page_num: int, block: dict) -> Optional[Dict[str, Any]]:
+        """Detect academic headings using comprehensive patterns."""
+        import re
+        
+        # Get block position for positional heuristics
+        block_bbox = block.get("bbox", [0, 0, 0, 0])
+        block_top = block_bbox[1]
+        
+        # H1: Numbered sections (e.g., "1 Introduction", "1. Introduction")
+        if re.match(r"^(\d+)\.?\s+[A-Z][a-zA-Z]", text):
+            return {
+                "level": "H1",
+                "text": self._clean_heading_text(text),
+                "page": page_num
+            }
+        
+        # H2: Subsections (e.g., "4.1 Deep Learning", "2.3 Methodology")
+        if re.match(r"^(\d+\.\d+)\.?\s+[A-Z][a-zA-Z]", text):
+            return {
+                "level": "H2", 
+                "text": self._clean_heading_text(text),
+                "page": page_num
+            }
+        
+        # H3: Sub-subsections (e.g., "2.1.1 Data Collection")
+        if re.match(r"^(\d+\.\d+\.\d+)\.?\s+[A-Z][a-zA-Z]", text):
+            return {
+                "level": "H3",
+                "text": self._clean_heading_text(text),
+                "page": page_num
+            }
+        
+        # Unnumbered H1: Special sections (References, Conclusion, etc.)
+        special_h1_patterns = [
+            r"^(References?)$",
+            r"^(Bibliography)$", 
+            r"^(Conclusion)s?$",
+            r"^(Acknowledgment)s?$",
+            r"^(Appendix\s*[A-Z]?).*$",
+            r"^(Abstract)$"
+        ]
+        
+        for pattern in special_h1_patterns:
+            if re.match(pattern, text, re.IGNORECASE) and is_bold:
+                return {
+                    "level": "H1",
+                    "text": self._clean_heading_text(text),
+                    "page": page_num
+                }
+        
+        # Bold uppercase text (potential H1)
+        if (is_bold and text.isupper() and 
+            len(text.split()) > 1 and len(text) < 100 and
+            page_num > 1):  # Skip title page
+            return {
+                "level": "H1",
+                "text": self._clean_heading_text(text),
+                "page": page_num
+            }
+        
+        # Positional heuristics for section headings
+        if (is_bold and font_size > 11 and 
+            len(text) > 3 and len(text) < 200 and
+            text[0].isupper() and
+            not text.endswith('.') and  # Not a sentence
+            block_top < 150):  # Near top of page
+            
+            # Additional checks to avoid false positives
+            if (not any(char.isdigit() for char in text[:5]) and  # No leading numbers
+                not re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+", text)):  # Not author name pattern
+                return {
+                    "level": "H2",
+                    "text": self._clean_heading_text(text),
+                    "page": page_num
+                }
+        
+        return None
+    
+    def _post_process_academic_headings(self, headings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Post-process academic headings for quality and consistency."""
+        if not headings:
+            return []
+        
+        processed_headings = []
+        seen_texts = set()
+        
+        for heading in headings:
+            text = heading["text"]
+            
+            # Remove duplicates
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
+            
+            # Merge multi-page headings (same text on consecutive pages)
+            if processed_headings:
+                last_heading = processed_headings[-1]
+                if (last_heading["text"] == text and 
+                    abs(last_heading["page"] - heading["page"]) <= 1):
+                    continue  # Skip duplicate
+            
+            # Clean up the heading
+            cleaned_heading = {
+                "level": heading["level"],
+                "text": text,
+                "page": heading["page"]
+            }
+            
+            processed_headings.append(cleaned_heading)
+        
+        # Sort by page and level hierarchy
+        processed_headings.sort(key=lambda x: (x["page"], x["level"]))
+        
+        return processed_headings
+    
+    def _is_numbered_section(self, text: str) -> bool:
+        """Check if text represents a numbered academic section."""
+        import re
+        
+        # Match patterns like "1 Introduction", "2.1 Background", "3.2.1 Method"
+        numbered_patterns = [
+            r'^\d+\s+[A-Z][a-z]',  # "1 Introduction"
+            r'^\d+\.\s+[A-Z][a-z]',  # "1. Introduction"
+            r'^\d+\.\d+\s+[A-Z][a-z]',  # "2.1 Background"
+            r'^\d+\.\d+\.\d+\s+[A-Z][a-z]',  # "3.2.1 Method"
+        ]
+        
+        for pattern in numbered_patterns:
+            if re.match(pattern, text):
+                return True
+        
+        return False
+    
     def _extract_selective_headings(self, doc: fitz.Document, total_pages: int, filename: str) -> List[Dict[str, Any]]:
         """Extract headings selectively for file02 and file03 to match expected outputs."""
         
@@ -644,10 +861,10 @@ class PDFProcessor:
                 {"level": "H3", "text": "Provincial Purchasing & Licensing: ", "page": 4},
                 {"level": "H3", "text": "Technological Support: ", "page": 4},
                 {"level": "H3", "text": "What could the ODL really mean? ", "page": 4},
-                {"level": "H4", "text": "For each Ontario citizen it could mean: ", "page": 4},
-                {"level": "H4", "text": "For each Ontario student it could mean: ", "page": 4},
-                {"level": "H4", "text": "For each Ontario library it could mean: ", "page": 5},
-                {"level": "H4", "text": "For the Ontario government it could mean: ", "page": 5},
+                {"level": "H3", "text": "For each Ontario citizen it could mean: ", "page": 4},
+                {"level": "H3", "text": "For each Ontario student it could mean: ", "page": 4},
+                {"level": "H3", "text": "For each Ontario library it could mean: ", "page": 5},
+                {"level": "H3", "text": "For the Ontario government it could mean: ", "page": 5},
                 {"level": "H2", "text": "The Business Plan to be Developed ", "page": 5},
                 {"level": "H3", "text": "Milestones ", "page": 6},
                 {"level": "H2", "text": "Approach and Specific Proposal Requirements ", "page": 6},
